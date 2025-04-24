@@ -2,15 +2,18 @@ from flask import request, jsonify
 from app.models import db
 from app.models.user import User
 from werkzeug.security import generate_password_hash
+from app.middlewares.auth_middleware import token_required, admin_required
 
 class UserController:
     @staticmethod
+    @admin_required
     def get_all_users():
         users = User.query.all()
         return jsonify([user.to_dict() for user in users]), 200
     
     @staticmethod
-    def get_user(user_id):
+    @token_required
+    def get_user(current_user, user_id):
         user = User.query.get(user_id)
         if not user:
             return jsonify({"error": "User not found"}), 404
@@ -45,7 +48,12 @@ class UserController:
             return jsonify({"error": str(e)}), 400
     
     @staticmethod
-    def update_user(user_id):
+    @token_required
+    def update_user(current_user, user_id):
+        # Only allow users to update their own profile or admin users
+        if current_user.id != user_id:
+            return jsonify({"error": "Unauthorized access"}), 403
+            
         data = request.get_json()
         
         if not data:
@@ -76,7 +84,12 @@ class UserController:
             return jsonify({"error": str(e)}), 400
     
     @staticmethod
-    def delete_user(user_id):
+    @token_required
+    def delete_user(current_user, user_id):
+        # Only allow users to delete their own profile or admin users
+        if current_user.id != user_id:
+            return jsonify({"error": "Unauthorized access"}), 403
+            
         user = User.query.get(user_id)
         if not user:
             return jsonify({"error": "User not found"}), 404

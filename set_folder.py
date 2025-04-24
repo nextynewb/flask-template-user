@@ -29,7 +29,6 @@ def setup_flask_mvc_structure():
     create_directory("app/utils")
     create_directory("app/middlewares")
     create_directory("app/config")
-    create_directory("migrations")
     create_directory("tests")
     create_directory("tests/unit")
     create_directory("tests/integration")
@@ -61,6 +60,7 @@ class Config:
     SECRET_KEY = os.environ.get('SECRET_KEY') or 'you-will-never-guess'
     SQLALCHEMY_DATABASE_URI = os.environ.get('DATABASE_URL') or 'sqlite:///app.db'
     SQLALCHEMY_TRACK_MODIFICATIONS = False
+    JWT_EXPIRATION_HOURS = 24
 """)
     
     # Models
@@ -73,6 +73,7 @@ from app.models.user import User
     
     create_file("app/models/user.py", """from datetime import datetime
 from app.models import db
+from werkzeug.security import generate_password_hash, check_password_hash
 
 class User(db.Model):
     __tablename__ = 'users'
@@ -95,6 +96,9 @@ class User(db.Model):
             'created_at': self.created_at.isoformat(),
             'updated_at': self.updated_at.isoformat()
         }
+        
+    def check_password(self, password):
+        return check_password_hash(self.password_hash, password)
 """)
     
     # Controllers
@@ -103,15 +107,18 @@ class User(db.Model):
 from app.models import db
 from app.models.user import User
 from werkzeug.security import generate_password_hash
+from app.middlewares.auth_middleware import token_required
 
 class UserController:
     @staticmethod
-    def get_all_users():
+    @token_required
+    def get_all_users(current_user):
         users = User.query.all()
         return jsonify([user.to_dict() for user in users]), 200
     
     @staticmethod
-    def get_user(user_id):
+    @token_required
+    def get_user(current_user, user_id):
         user = User.query.get(user_id)
         if not user:
             return jsonify({"error": "User not found"}), 404
@@ -146,7 +153,12 @@ class UserController:
             return jsonify({"error": str(e)}), 400
     
     @staticmethod
-    def update_user(user_id):
+    @token_required
+    def update_user(current_user, user_id):
+        # Only allow users to update their own profile or admin users
+        if current_user.id != user_id:
+            return jsonify({"error": "Unauthorized access"}), 403
+            
         data = request.get_json()
         
         if not data:
@@ -177,7 +189,12 @@ class UserController:
             return jsonify({"error": str(e)}), 400
     
     @staticmethod
-    def delete_user(user_id):
+    @token_required
+    def delete_user(current_user, user_id):
+        # Only allow users to delete their own profile or admin users
+        if current_user.id != user_id:
+            return jsonify({"error": "Unauthorized access"}), 403
+            
         user = User.query.get(user_id)
         if not user:
             return jsonify({"error": "User not found"}), 404
@@ -190,35 +207,117 @@ class UserController:
             db.session.rollback()
             return jsonify({"error": str(e)}), 400
 """)
+
+    create_file("app/controllers/auth_controller.py", """from flask import request, jsonify, current_app
+from app.models.user import User
+import jwt
+import datetime
+
+class AuthController:
+    @staticmethod
+    def login():
+        data = request.get_json()
+        
+        if not data or not all(k in data for k in ('username', 'password')):
+            return jsonify({"error": "Missing username or password"}), 400
+        
+        user = User.query.filter_by(username=data['username']).first()
+        
+        if not user or not user.check_password(data['password']):
+            return jsonify({"error": "Invalid username or password"}), 401
+        
+        # Generate JWT token
+        expiration = datetime.datetime.utcnow() + datetime.timedelta(
+            hours=current_app.config.get('JWT_EXPIRATION_HOURS', 24)
+        )
+        
+        token = jwt.encode({
+            'user_id': user.id,
+            'username': user.username,
+            'exp': expiration
+        }, current_app.config['SECRET_KEY'])
+        
+        return jsonify({
+            'token': token,
+            'user': user.to_dict(),
+            'expires_at': expiration.isoformat()
+        }), 200
+""")
+    
+    # Middlewares
+    create_file("app/middlewares/__init__.py")
+    create_file("app/middlewares/auth_middleware.py", """from functools import wraps
+from flask import request, jsonify, current_app
+import jwt
+from app.models.user import User
+
+def token_required(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        token = None
+        
+        # Check if token is in headers
+        if 'Authorization' in request.headers:
+            auth_header = request.headers['Authorization']
+            if auth_header.startswith('Bearer '):
+                token = auth_header.split(' ')[1]
+        
+        if not token:
+            return jsonify({'error': 'Token is missing'}), 401
+        
+        try:
+            # Decode the token
+            data = jwt.decode(token, current_app.config['SECRET_KEY'], algorithms=["HS256"])
+            current_user = User.query.get(data['user_id'])
+            
+            if not current_user:
+                return jsonify({'error': 'Invalid token - user not found'}), 401
+                
+        except jwt.ExpiredSignatureError:
+            return jsonify({'error': 'Token has expired'}), 401
+        except jwt.InvalidTokenError:
+            return jsonify({'error': 'Invalid token'}), 401
+        
+        # Pass the current user to the route function
+        return f(current_user, *args, **kwargs)
+    
+    return decorated
+""")
     
     # Routes
     create_file("app/routes/__init__.py", """from app.routes.user_routes import register_user_routes
+from app.routes.auth_routes import register_auth_routes
 
 def register_routes(app):
     register_user_routes(app)
+    register_auth_routes(app)
 """)
     
     create_file("app/routes/user_routes.py", """from app.controllers.user_controller import UserController
 
 def register_user_routes(app):
-    # Get all users
+    # Get all users (protected)
     app.add_url_rule('/api/users', 'get_users', UserController.get_all_users, methods=['GET'])
     
-    # Get a specific user
+    # Get a specific user (protected)
     app.add_url_rule('/api/users/<int:user_id>', 'get_user', UserController.get_user, methods=['GET'])
     
-    # Create a new user
+    # Create a new user (public)
     app.add_url_rule('/api/users', 'create_user', UserController.create_user, methods=['POST'])
     
-    # Update a user
+    # Update a user (protected)
     app.add_url_rule('/api/users/<int:user_id>', 'update_user', UserController.update_user, methods=['PUT'])
     
-    # Delete a user
+    # Delete a user (protected)
     app.add_url_rule('/api/users/<int:user_id>', 'delete_user', UserController.delete_user, methods=['DELETE'])
 """)
-    
-    # Middlewares
-    create_file("app/middlewares/__init__.py")
+
+    create_file("app/routes/auth_routes.py", """from app.controllers.auth_controller import AuthController
+
+def register_auth_routes(app):
+    # Login route
+    app.add_url_rule('/api/auth/login', 'login', AuthController.login, methods=['POST'])
+""")
     
     # Utils
     create_file("app/utils/__init__.py")
@@ -232,15 +331,7 @@ if __name__ == '__main__':
     app.run(debug=True)
 """)
     
-    create_file(".env", """SECRET_KEY=your-secret-key-here
-DATABASE_URL=sqlite:///app.db
-FLASK_APP=run.py
-FLASK_ENV=development
-""")
-    
-    print("\nFlask MVC structure has been set up successfully!")
-
-# Add this to your setup_flask_mvc_structure function
+    # Database initialization script
     create_file("init_db.py", """from app import create_app
 from app.models import db
 
@@ -250,7 +341,25 @@ with app.app_context():
     db.create_all()
     print("Database tables created successfully!")
 """)
-
+    
+    # Environment variables
+    create_file(".env", """SECRET_KEY=your-secret-key-here
+DATABASE_URL=sqlite:///app.db
+FLASK_APP=run.py
+FLASK_ENV=development
+JWT_EXPIRATION_HOURS=24
+""")
+    
+    # Requirements file
+    create_file("requirements.txt", """flask==2.0.1
+flask-sqlalchemy==2.5.1
+python-dotenv==0.19.0
+werkzeug==2.0.1
+pyjwt==2.1.0
+""")
+    
+    print("\nFlask MVC structure with authentication has been set up successfully!")
+    print("To initialize the database, run: python init_db.py")
 
 if __name__ == "__main__":
     setup_flask_mvc_structure()
