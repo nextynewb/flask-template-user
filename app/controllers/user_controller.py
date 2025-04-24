@@ -6,7 +6,6 @@ from app.middlewares.auth_middleware import token_required, admin_required
 
 class UserController:
     @staticmethod
-    @admin_required
     def get_all_users():
         users = User.query.all()
         return jsonify([user.to_dict() for user in users]), 200
